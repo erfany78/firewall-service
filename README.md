@@ -36,8 +36,9 @@ The service runs a TCP server on `127.0.0.1:45455`. All commands and responses a
 | `STATUS` | Queries whether the Windows Firewall is active. | `STATUS:ON` or `STATUS:OFF` |
 | `ALLOW:<AppPath>` | Removes the app from block list, deletes its block rules, and adds allow rules. | `SUCCESS` or `ERROR: <reason>` |
 | `BLOCK:<AppPath>` | Adds the app to the block list, blocks all traffic, and kills running instances. | `SUCCESS` or `ERROR: <reason>` |
-| `LOCK` | Enables all Windows Firewall profiles (Domain, Private, Public). | `SUCCESS` or `ERROR: <reason>` |
-| `UNLOCK` | Disables all Windows Firewall profiles. | `SUCCESS` or `ERROR: <reason>` |
+| `LOCK` or `MODE:LOCKDOWN` | Transitions to **LOCKDOWN Mode** (fully enables firewall, applies block rules, starts killing blocked processes). | `SUCCESS` or `ERROR: <reason>` |
+| `UNLOCK` or `MODE:ALLOW` | Transitions to **ALLOW Mode** (removes firewall block rules, disables profiles, suspends process killing and integrity check loops). | `SUCCESS` or `ERROR: <reason>` |
+| `GET_MODE` | Queries the current operation mode. | `MODE:ALLOW` or `MODE:LOCKDOWN` |
 | `RESET` | Resets the Windows Firewall to default configurations. | `SUCCESS` or `ERROR: <reason>` |
 | `KILL:<AppPath>` | Force-closes any running process matching the executable path. | `SUCCESS` or `ERROR: <reason>` |
 
