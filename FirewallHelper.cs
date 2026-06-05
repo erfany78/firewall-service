@@ -347,10 +347,14 @@ namespace FlutterFirewallManager
             if (IsAllowMode) return;
             if (BlockedApps.IsEmpty) return;
 
+            int currentPid = Environment.ProcessId;
+
             foreach (var process in Process.GetProcesses())
             {
                 try
                 {
+                    if (process.Id == currentPid) continue;
+
                     string path = process.MainModule?.FileName ?? "";
                     if (string.IsNullOrEmpty(path)) continue;
 
@@ -375,10 +379,14 @@ namespace FlutterFirewallManager
         public static void KillProcessesForPath(string appPath)
         {
             string normalizedPath = NormalizePath(appPath);
+            int currentPid = Environment.ProcessId;
+
             foreach (var process in Process.GetProcesses())
             {
                 try
                 {
+                    if (process.Id == currentPid) continue;
+
                     string path = process.MainModule?.FileName ?? "";
                     if (string.IsNullOrEmpty(path)) continue;
 
