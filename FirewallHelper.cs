@@ -171,6 +171,7 @@ namespace FlutterFirewallManager
         public static async Task BlockApplicationAsync(string appPath, CancellationToken cancellationToken)
         {
             ValidateAppPath(appPath);
+            VerifyNotCriticalApp(appPath);
             string appName = Path.GetFileNameWithoutExtension(appPath);
             string allowRuleName = $"{RulePrefixAllow}{appName}";
             string blockRuleName = $"{RulePrefixBlock}{appName}";
@@ -378,6 +379,7 @@ namespace FlutterFirewallManager
         /// </summary>
         public static void KillProcessesForPath(string appPath)
         {
+            VerifyNotCriticalApp(appPath);
             string normalizedPath = NormalizePath(appPath);
             int currentPid = Environment.ProcessId;
 
@@ -473,6 +475,42 @@ namespace FlutterFirewallManager
             catch (Exception ex) when (ex is not ArgumentException)
             {
                 throw new ArgumentException($"Invalid application path format: {ex.Message}", ex);
+            }
+        }
+
+        /// <summary>
+        /// Prevents critical applications and the firewall service itself from being blocked or terminated.
+        /// </summary>
+        private static void VerifyNotCriticalApp(string appPath)
+        {
+            if (string.IsNullOrWhiteSpace(appPath)) return;
+            string normalized = NormalizePath(appPath);
+            string fileName = Path.GetFileName(normalized);
+
+            // 1. Prevent blocking the firewall manager service itself
+            string ownPath = NormalizePath(Environment.ProcessPath ?? "");
+            if (normalized == ownPath || fileName.Equals("firewall.exe", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException("Cannot block or terminate the firewall manager service itself.");
+            }
+
+            // 2. Prevent blocking critical Windows system processes
+            var criticalApps = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "explorer.exe",
+                "svchost.exe",
+                "lsass.exe",
+                "wininit.exe",
+                "winlogon.exe",
+                "services.exe",
+                "csrss.exe",
+                "smss.exe",
+                "taskmgr.exe"
+            };
+
+            if (criticalApps.Contains(fileName))
+            {
+                throw new InvalidOperationException($"Cannot block or terminate critical system process: '{fileName}'.");
             }
         }
 
