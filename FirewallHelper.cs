@@ -42,7 +42,7 @@ namespace FlutterFirewallManager
         // Thread-safe dictionary storing normalized path -> original app path
         private static readonly ConcurrentDictionary<string, string> BlockedApps = new ConcurrentDictionary<string, string>();
 
-        public static bool IsAllowMode { get; set; } = false;
+        public static bool IsAllowMode { get; set; } = true;
 
         /// <summary>
         /// Initializes the blocked application list by loading persisted paths from disk.
