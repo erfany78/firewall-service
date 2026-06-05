@@ -12,7 +12,7 @@ It runs with `LocalSystem` privileges, communicates over a local TCP socket (`12
 
 ## 🚀 Key Features
 
-* **Pre-Shared Key Security (IPC Protection)**: Only authorized local processes sending the secret token `AUTH:ExamLockdownSecureToken2026` can configure the firewall. Unauthenticated connections are dropped instantly.
+* **Pre-Shared Key Security (IPC Protection)**: Only authorized local processes sending the secret token `AUTH:553220ea750b04994de7bd70f` can configure the firewall. Unauthenticated connections are dropped instantly.
 * **Firewall Integrity & Self-Healing Loop**:
   * Scans Windows Firewall states every **5 seconds**.
   * Uses ultra-fast, in-process **COM Interop (`HNetCfg.FwPolicy2`)** to query rules at **0% CPU** overhead.
@@ -32,7 +32,7 @@ The service runs a TCP server on `127.0.0.1:45455`. All commands and responses a
 ### Client Commands
 | Command | Description | Expected Response |
 | :--- | :--- | :--- |
-| `AUTH:ExamLockdownSecureToken2026` | Authenticates the socket connection. **Must be the first command sent.** | `SUCCESS: Authenticated` |
+| `AUTH:553220ea750b04994de7bd70f` | Authenticates the socket connection. **Must be the first command sent.** | `SUCCESS: Authenticated` |
 | `STATUS` | Queries whether the Windows Firewall is active. | `STATUS:ON` or `STATUS:OFF` |
 | `ALLOW:<AppPath>` | Removes the app from block list, deletes its block rules, and adds allow rules. | `SUCCESS` or `ERROR: <reason>` |
 | `BLOCK:<AppPath>` | Adds the app to the block list, blocks all traffic, and kills running instances. | `SUCCESS` or `ERROR: <reason>` |
@@ -99,7 +99,7 @@ import 'dart:io';
 class FirewallService {
   static const String _host = '127.0.0.1';
   static const int _port = 45455;
-  static const String _authKey = 'ExamLockdownSecureToken2026';
+  static const String _authKey = '553220ea750b04994de7bd70f';
 
   Socket? _socket;
   final _eventController = StreamController<String>.broadcast();
