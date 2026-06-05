@@ -1,0 +1,12 @@
+# .NET / Visual Studio
+[Bb]in/
+[Oo]bj/
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Antigravity / Agent history
+.history/
+.system_generated/
