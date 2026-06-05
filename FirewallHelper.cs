@@ -42,6 +42,8 @@ namespace FlutterFirewallManager
         // Thread-safe dictionary storing normalized path -> original app path
         private static readonly ConcurrentDictionary<string, string> BlockedApps = new ConcurrentDictionary<string, string>();
 
+        public static bool IsAllowMode { get; set; } = false;
+
         /// <summary>
         /// Initializes the blocked application list by loading persisted paths from disk.
         /// </summary>
@@ -151,6 +153,12 @@ namespace FlutterFirewallManager
             await DeleteRuleAsync(allowRuleName, cancellationToken);
             await DeleteRuleAsync(blockRuleName, cancellationToken);
 
+            if (IsAllowMode)
+            {
+                // In Allow Mode, we don't need to add allow rules because the firewall is disabled
+                return;
+            }
+
             // Add inbound and outbound allow rules
             await AddRuleAsync(allowRuleName, "in", "allow", appPath, cancellationToken);
             await AddRuleAsync(allowRuleName, "out", "allow", appPath, cancellationToken);
@@ -172,6 +180,15 @@ namespace FlutterFirewallManager
             BlockedApps[normalized] = appPath;
             SaveBlockedApps();
 
+            if (IsAllowMode)
+            {
+                // In Allow Mode, we do NOT apply rules or kill processes.
+                // We just make sure any existing block rule is deleted to keep it clean.
+                await DeleteRuleAsync(allowRuleName, cancellationToken);
+                await DeleteRuleAsync(blockRuleName, cancellationToken);
+                return;
+            }
+
             // Force close any running instance of the blocked app immediately
             KillProcessesForPath(normalized);
 
@@ -190,6 +207,7 @@ namespace FlutterFirewallManager
         /// </summary>
         public static async Task EnforceFirewallIntegrityAsync(ILogger logger, CancellationToken cancellationToken)
         {
+            if (IsAllowMode) return;
             // 1. Check and restore Firewall State (Domain, Private, Public profiles must be enabled)
             try
             {
@@ -326,6 +344,7 @@ namespace FlutterFirewallManager
         /// </summary>
         public static void ForceCloseRunningBlockedApps(ILogger logger)
         {
+            if (IsAllowMode) return;
             if (BlockedApps.IsEmpty) return;
 
             foreach (var process in Process.GetProcesses())
@@ -519,6 +538,81 @@ namespace FlutterFirewallManager
             await process.WaitForExitAsync(cancellationToken);
 
             return (process.ExitCode, await stdOutTask, await stdErrTask);
+        }
+
+        /// <summary>
+        /// Transitions the service mode between LOCKDOWN (default) and ALLOW.
+        /// In ALLOW mode:
+        /// 1. We remove all block rules for currently registered blocked applications.
+        /// 2. We unlock/disable the Windows Firewall.
+        /// 3. Process monitor loops and integrity loops are suspended.
+        /// In LOCKDOWN mode:
+        /// 1. We lock/enable the Windows Firewall.
+        /// 2. We re-apply block rules for all registered blocked applications.
+        /// 3. Background enforcement and process monitoring resume.
+        /// </summary>
+        public static async Task SetAllowModeAsync(bool enableAllowMode, ILogger logger, CancellationToken cancellationToken)
+        {
+            IsAllowMode = enableAllowMode;
+            if (enableAllowMode)
+            {
+                logger.LogInformation("Transitioning to ALLOW mode. Suspending lockdown enforcement and removing firewall block rules...");
+                // 1. Remove all block rules for currently registered blocked applications
+                foreach (var kvp in BlockedApps)
+                {
+                    try
+                    {
+                        string appName = Path.GetFileNameWithoutExtension(kvp.Value);
+                        string blockRuleName = $"{RulePrefixBlock}{appName}";
+                        string allowRuleName = $"{RulePrefixAllow}{appName}";
+                        await DeleteRuleAsync(blockRuleName, cancellationToken);
+                        await DeleteRuleAsync(allowRuleName, cancellationToken);
+                        logger.LogInformation("Removed firewall rules for '{AppName}' due to ALLOW mode transition.", appName);
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError(ex, "Failed to remove rules for '{AppName}' during ALLOW mode transition.", kvp.Value);
+                    }
+                }
+                
+                // 2. Unlock/disable the firewall profiles
+                try
+                {
+                    await UnlockFirewallAsync(cancellationToken);
+                    logger.LogInformation("Firewall profiles disabled due to ALLOW mode transition.");
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(ex, "Failed to disable firewall profiles during ALLOW mode transition.");
+                }
+            }
+            else
+            {
+                logger.LogInformation("Transitioning to LOCKDOWN mode. Re-enabling firewall and applying block rules...");
+                // 1. Lock/enable the firewall profiles
+                try
+                {
+                    await LockFirewallAsync(cancellationToken);
+                    logger.LogInformation("Firewall profiles enabled due to LOCKDOWN mode transition.");
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(ex, "Failed to enable firewall profiles during LOCKDOWN mode transition.");
+                }
+
+                // 2. Re-apply block rules for all registered applications
+                foreach (var kvp in BlockedApps)
+                {
+                    try
+                    {
+                        await BlockApplicationAsync(kvp.Value, cancellationToken);
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError(ex, "Failed to re-apply block rule for '{AppName}' during LOCKDOWN mode transition.", kvp.Value);
+                    }
+                }
+            }
         }
     }
 }

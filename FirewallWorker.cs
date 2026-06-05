@@ -302,34 +302,40 @@ namespace FlutterFirewallManager
                 }
             }
 
-            // 4. LOCK command
-            if (command.Equals("LOCK", StringComparison.OrdinalIgnoreCase))
+            // 4. LOCK command (transitions to LOCKDOWN mode)
+            if (command.Equals("LOCK", StringComparison.OrdinalIgnoreCase) || command.Equals("MODE:LOCKDOWN", StringComparison.OrdinalIgnoreCase))
             {
                 try
                 {
-                    await FirewallHelper.LockFirewallAsync(cancellationToken);
+                    await FirewallHelper.SetAllowModeAsync(false, _logger, cancellationToken);
                     return "SUCCESS";
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Error executing LOCK command.");
+                    _logger.LogError(ex, "Error transitioning to LOCKDOWN mode.");
                     return $"ERROR: {ex.Message}";
                 }
             }
 
-            // 5. UNLOCK command
-            if (command.Equals("UNLOCK", StringComparison.OrdinalIgnoreCase))
+            // 5. UNLOCK command (transitions to ALLOW mode)
+            if (command.Equals("UNLOCK", StringComparison.OrdinalIgnoreCase) || command.Equals("MODE:ALLOW", StringComparison.OrdinalIgnoreCase))
             {
                 try
                 {
-                    await FirewallHelper.UnlockFirewallAsync(cancellationToken);
+                    await FirewallHelper.SetAllowModeAsync(true, _logger, cancellationToken);
                     return "SUCCESS";
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Error executing UNLOCK command.");
+                    _logger.LogError(ex, "Error transitioning to ALLOW mode.");
                     return $"ERROR: {ex.Message}";
                 }
+            }
+
+            // GET_MODE command
+            if (command.Equals("GET_MODE", StringComparison.OrdinalIgnoreCase))
+            {
+                return FirewallHelper.IsAllowMode ? "MODE:ALLOW" : "MODE:LOCKDOWN";
             }
 
             // 6. RESET command

@@ -10,3 +10,5 @@
 # Antigravity / Agent history
 .history/
 .system_generated/
+publish/
+*.log
