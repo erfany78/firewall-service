@@ -38,11 +38,27 @@ namespace FlutterFirewallManager
             "FlutterFirewallManager"
         );
         private static readonly string BlockedListPath = Path.Combine(BlockedListDir, "blocked_apps.txt");
+        private static readonly string SafeListPath = Path.Combine(BlockedListDir, "safe_apps.txt");
+        private static readonly string StrategyPath = Path.Combine(BlockedListDir, "strategy.txt");
 
         // Thread-safe dictionary storing normalized path -> original app path
         private static readonly ConcurrentDictionary<string, string> BlockedApps = new ConcurrentDictionary<string, string>();
 
+        // Thread-safe dictionary storing normalized path -> original safe app path
+        private static readonly ConcurrentDictionary<string, string> SafeApps = new ConcurrentDictionary<string, string>();
+
+        // Thread-safe dictionary storing active client PIDs -> client app path
+        public static readonly ConcurrentDictionary<int, string> ActiveClientPids = new ConcurrentDictionary<int, string>();
+
         public static bool IsAllowMode { get; set; } = true;
+
+        public enum FilteringStrategy
+        {
+            Blacklist,
+            Whitelist
+        }
+
+        public static FilteringStrategy CurrentStrategy { get; private set; } = FilteringStrategy.Blacklist;
 
         /// <summary>
         /// Initializes the blocked application list by loading persisted paths from disk.
@@ -99,6 +115,162 @@ namespace FlutterFirewallManager
         }
 
         /// <summary>
+        /// Initializes the filtering strategy by loading persisted state from disk.
+        /// </summary>
+        public static void InitializeStrategy(ILogger logger)
+        {
+            try
+            {
+                if (File.Exists(StrategyPath))
+                {
+                    string content = File.ReadAllText(StrategyPath).Trim();
+                    if (Enum.TryParse<FilteringStrategy>(content, true, out var strategy))
+                    {
+                        CurrentStrategy = strategy;
+                        logger.LogInformation("Loaded filtering strategy from disk: {Strategy}", CurrentStrategy);
+                        return;
+                    }
+                }
+                CurrentStrategy = FilteringStrategy.Blacklist;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Failed to initialize filtering strategy from disk.");
+            }
+        }
+
+        /// <summary>
+        /// Saves the current filtering strategy to disk.
+        /// </summary>
+        public static void SaveStrategy()
+        {
+            try
+            {
+                File.WriteAllText(StrategyPath, CurrentStrategy.ToString());
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException($"Failed to save strategy: {ex.Message}", ex);
+            }
+        }
+
+        /// <summary>
+        /// Sets and applies the filtering strategy.
+        /// </summary>
+        public static async Task SetStrategyAsync(FilteringStrategy strategy, ILogger logger, CancellationToken cancellationToken)
+        {
+            CurrentStrategy = strategy;
+            SaveStrategy();
+            
+            if (!IsAllowMode)
+            {
+                await ApplyCurrentStrategyAsync(logger, cancellationToken);
+            }
+        }
+
+        /// <summary>
+        /// Initializes the safe application list by loading persisted paths from disk.
+        /// </summary>
+        public static void InitializeSafeAppsList(ILogger logger)
+        {
+            try
+            {
+                if (!Directory.Exists(BlockedListDir))
+                {
+                    Directory.CreateDirectory(BlockedListDir);
+                }
+
+                if (File.Exists(SafeListPath))
+                {
+                    var lines = File.ReadAllLines(SafeListPath);
+                    foreach (var line in lines)
+                    {
+                        string path = line.Trim();
+                        if (!string.IsNullOrWhiteSpace(path))
+                        {
+                            string normalized = NormalizePath(path);
+                            SafeApps[normalized] = path;
+                        }
+                    }
+                    logger.LogInformation("Loaded {Count} safe applications from disk.", SafeApps.Count);
+                }
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Failed to initialize safe apps list from disk.");
+            }
+        }
+
+        /// <summary>
+        /// Saves the current list of safe applications to disk.
+        /// </summary>
+        private static void SaveSafeApps()
+        {
+            try
+            {
+                if (!Directory.Exists(BlockedListDir))
+                {
+                    Directory.CreateDirectory(BlockedListDir);
+                }
+
+                File.WriteAllLines(SafeListPath, SafeApps.Values);
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException($"Failed to write safe applications database to disk: {ex.Message}", ex);
+            }
+        }
+
+        /// <summary>
+        /// Adds a permanent entry to the SAFE list (whitelisted application).
+        /// </summary>
+        public static async Task AddSafeAppAsync(string appPath, CancellationToken cancellationToken)
+        {
+            ValidateAppPath(appPath);
+
+            // Log safe app addition to Sentry
+            Sentry.SentrySdk.CaptureMessage($"Safe application added: {appPath}", Sentry.SentryLevel.Info);
+
+            string normalized = NormalizePath(appPath);
+
+            // Remove from blocked apps first if present
+            if (BlockedApps.ContainsKey(normalized))
+            {
+                await AllowApplicationAsync(appPath, cancellationToken);
+            }
+
+            SafeApps[normalized] = appPath;
+            SaveSafeApps();
+        }
+
+        /// <summary>
+        /// Removes an entry from the SAFE list.
+        /// </summary>
+        public static void RemoveSafeApp(string appPath)
+        {
+            if (string.IsNullOrWhiteSpace(appPath)) return;
+            string normalized = NormalizePath(appPath);
+            SafeApps.TryRemove(normalized, out _);
+            SaveSafeApps();
+        }
+
+        /// <summary>
+        /// Returns a pipe-separated string of currently blocked application paths.
+        /// </summary>
+        public static string GetBlockedAppsList()
+        {
+            return string.Join("|", BlockedApps.Values);
+        }
+
+        /// <summary>
+        /// Returns a pipe-separated string of currently safe/whitelisted application paths.
+        /// </summary>
+        public static string GetSafeAppsList()
+        {
+            return string.Join("|", SafeApps.Values);
+        }
+
+        /// <summary>
         /// Checks if the Windows Firewall is currently enabled.
         /// </summary>
         public static async Task<bool> IsFirewallEnabledAsync(CancellationToken cancellationToken)
@@ -140,28 +312,53 @@ namespace FlutterFirewallManager
         public static async Task AllowApplicationAsync(string appPath, CancellationToken cancellationToken)
         {
             ValidateAppPath(appPath);
+
+            // Log application allow action to Sentry
+            Sentry.SentrySdk.CaptureMessage($"Application allowed: {appPath}", Sentry.SentryLevel.Info);
+
             string appName = Path.GetFileNameWithoutExtension(appPath);
             string allowRuleName = $"{RulePrefixAllow}{appName}";
             string blockRuleName = $"{RulePrefixBlock}{appName}";
-
-            // Remove from local blocking lists and persist to disk
             string normalized = NormalizePath(appPath);
-            BlockedApps.TryRemove(normalized, out _);
-            SaveBlockedApps();
 
-            // Delete existing rules for this app first to ensure clean state
-            await DeleteRuleAsync(allowRuleName, cancellationToken);
-            await DeleteRuleAsync(blockRuleName, cancellationToken);
-
-            if (IsAllowMode)
+            if (CurrentStrategy == FilteringStrategy.Blacklist)
             {
-                // In Allow Mode, we don't need to add allow rules because the firewall is disabled
-                return;
-            }
+                // Blacklist strategy: ALLOW means remove from BlockedApps (blacklist)
+                BlockedApps.TryRemove(normalized, out _);
+                SaveBlockedApps();
 
-            // Add inbound and outbound allow rules
-            await AddRuleAsync(allowRuleName, "in", "allow", appPath, cancellationToken);
-            await AddRuleAsync(allowRuleName, "out", "allow", appPath, cancellationToken);
+                await DeleteRuleAsync(allowRuleName, cancellationToken);
+                await DeleteRuleAsync(blockRuleName, cancellationToken);
+
+                if (IsAllowMode)
+                {
+                    return;
+                }
+
+                await AddRuleAsync(allowRuleName, "in", "allow", appPath, cancellationToken);
+                await AddRuleAsync(allowRuleName, "out", "allow", appPath, cancellationToken);
+            }
+            else
+            {
+                // Whitelist strategy: ALLOW means add to SafeApps (whitelist)
+                SafeApps[normalized] = appPath;
+                SaveSafeApps();
+
+                // Make sure it's not in BlockedApps
+                BlockedApps.TryRemove(normalized, out _);
+                SaveBlockedApps();
+
+                await DeleteRuleAsync(allowRuleName, cancellationToken);
+                await DeleteRuleAsync(blockRuleName, cancellationToken);
+
+                if (IsAllowMode)
+                {
+                    return;
+                }
+
+                await AddRuleAsync(allowRuleName, "in", "allow", appPath, cancellationToken);
+                await AddRuleAsync(allowRuleName, "out", "allow", appPath, cancellationToken);
+            }
         }
 
         /// <summary>
@@ -175,29 +372,24 @@ namespace FlutterFirewallManager
             string appName = Path.GetFileNameWithoutExtension(appPath);
             string allowRuleName = $"{RulePrefixAllow}{appName}";
             string blockRuleName = $"{RulePrefixBlock}{appName}";
-
-            // Register in the local blocking lists and persist to disk
             string normalized = NormalizePath(appPath);
+
+            // Add to BlockedApps (blacklist)
             BlockedApps[normalized] = appPath;
             SaveBlockedApps();
 
-            if (IsAllowMode)
-            {
-                // In Allow Mode, we do NOT apply rules or kill processes.
-                // We just make sure any existing block rule is deleted to keep it clean.
-                await DeleteRuleAsync(allowRuleName, cancellationToken);
-                await DeleteRuleAsync(blockRuleName, cancellationToken);
-                return;
-            }
+            // Remove from SafeApps (whitelist)
+            SafeApps.TryRemove(normalized, out _);
+            SaveSafeApps();
 
-            // Force close any running instance of the blocked app immediately
-            KillProcessesForPath(normalized);
-
-            // Delete existing rules for this app first to ensure clean state
             await DeleteRuleAsync(allowRuleName, cancellationToken);
             await DeleteRuleAsync(blockRuleName, cancellationToken);
 
-            // Add inbound and outbound block rules
+            if (IsAllowMode)
+            {
+                return;
+            }
+
             await AddRuleAsync(blockRuleName, "in", "block", appPath, cancellationToken);
             await AddRuleAsync(blockRuleName, "out", "block", appPath, cancellationToken);
         }
@@ -209,6 +401,7 @@ namespace FlutterFirewallManager
         public static async Task EnforceFirewallIntegrityAsync(ILogger logger, CancellationToken cancellationToken)
         {
             if (IsAllowMode) return;
+            
             // 1. Check and restore Firewall State (Domain, Private, Public profiles must be enabled)
             try
             {
@@ -217,8 +410,7 @@ namespace FlutterFirewallManager
                 {
                     logger.LogWarning("Firewall status tampered! Re-enabling all profiles to maintain system integrity...");
                     await LockFirewallAsync(cancellationToken);
-                    
-                    // Broadcast event to all connected sockets
+                    await ApplyCurrentStrategyAsync(logger, cancellationToken); // Apply policy & rules
                     await FirewallEvents.BroadcastAsync("STATUS_RESTORED");
                 }
             }
@@ -227,30 +419,86 @@ namespace FlutterFirewallManager
                 logger.LogError(ex, "Failed to verify or restore firewall enabled status.");
             }
 
-            // 2. Check and restore individual blocked app rules
-            if (BlockedApps.IsEmpty) return;
-
+            // 2. Check and restore rules based on Strategy
             try
             {
                 var ruleCounts = GetActiveRuleNameCounts(logger);
-                
-                foreach (var kvp in BlockedApps)
-                {
-                    string appPath = kvp.Value;
-                    string appName = Path.GetFileNameWithoutExtension(appPath);
-                    string blockRuleName = $"{RulePrefixBlock}{appName}";
 
-                    // We expect exactly 2 rules: one inbound and one outbound
-                    ruleCounts.TryGetValue(blockRuleName, out int count);
-                    if (count < 2)
+                if (CurrentStrategy == FilteringStrategy.Blacklist)
+                {
+                    foreach (var kvp in BlockedApps)
                     {
-                        logger.LogWarning("Firewall rule integrity violation detected for '{AppName}' (Expected 2 rules, found {Count}). Re-applying block rules...", appName, count);
-                        
-                        // Re-apply rules
-                        await BlockApplicationAsync(appPath, cancellationToken);
-                        
-                        // Broadcast event to all connected sockets
-                        await FirewallEvents.BroadcastAsync($"RULE_RESTORED:{appName}");
+                        string appPath = kvp.Value;
+                        string appName = Path.GetFileNameWithoutExtension(appPath);
+                        string blockRuleName = $"{RulePrefixBlock}{appName}";
+
+                        ruleCounts.TryGetValue(blockRuleName, out int count);
+                        if (count < 2)
+                        {
+                            logger.LogWarning("Firewall rule integrity violation detected for '{AppName}' (Expected 2 rules, found {Count}). Re-applying block rules...", appName, count);
+                            await BlockApplicationAsync(appPath, cancellationToken);
+                            await FirewallEvents.BroadcastAsync($"RULE_RESTORED:{appName}");
+                        }
+                    }
+                }
+                else
+                {
+                    // Whitelist strategy self-healing
+                    foreach (var kvp in SafeApps)
+                    {
+                        string appPath = kvp.Value;
+                        string appName = Path.GetFileNameWithoutExtension(appPath);
+                        string allowRuleName = $"{RulePrefixAllow}{appName}";
+
+                        ruleCounts.TryGetValue(allowRuleName, out int count);
+                        if (count < 2)
+                        {
+                            logger.LogWarning("Firewall rule integrity violation detected for safe app '{AppName}' (Expected 2 rules, found {Count}). Re-applying allow rules...", appName, count);
+                            await AddSafeAppAsync(appPath, cancellationToken);
+                            await FirewallEvents.BroadcastAsync($"RULE_RESTORED:{appName}");
+                        }
+                    }
+
+                    // Enforce block rules for BlockedApps in Whitelist mode
+                    foreach (var kvp in BlockedApps)
+                    {
+                        string appPath = kvp.Value;
+                        string appName = Path.GetFileNameWithoutExtension(appPath);
+                        string blockRuleName = $"{RulePrefixBlock}{appName}";
+
+                        ruleCounts.TryGetValue(blockRuleName, out int count);
+                        if (count < 2)
+                        {
+                            logger.LogWarning("Firewall rule integrity violation detected for blocked app '{AppName}' in whitelist mode (Expected 2 rules, found {Count}). Re-applying block rules...", appName, count);
+                            await BlockApplicationAsync(appPath, cancellationToken);
+                            await FirewallEvents.BroadcastAsync($"RULE_RESTORED:{appName}");
+                        }
+                    }
+
+                    // Check system rules (DNS, DHCP, NTP, AD, Loopback, mDNS, NCSI, VPN)
+                    if (!ruleCounts.ContainsKey("AppManager_System_DNS_UDP") ||
+                        !ruleCounts.ContainsKey("AppManager_System_DNS_TCP") ||
+                        !ruleCounts.ContainsKey("AppManager_System_DHCP_Out") ||
+                        !ruleCounts.ContainsKey("AppManager_System_NTP_Out") ||
+                        !ruleCounts.ContainsKey("AppManager_System_Kerberos_UDP") ||
+                        !ruleCounts.ContainsKey("AppManager_System_Kerberos_TCP") ||
+                        !ruleCounts.ContainsKey("AppManager_System_LDAP_UDP") ||
+                        !ruleCounts.ContainsKey("AppManager_System_LDAP_TCP") ||
+                        !ruleCounts.ContainsKey("AppManager_System_Loopback_Out") ||
+                        !ruleCounts.ContainsKey("AppManager_System_Loopback_In") ||
+                        !ruleCounts.ContainsKey("AppManager_System_mDNS_Out") ||
+                        !ruleCounts.ContainsKey("AppManager_System_NCSI_Out") ||
+                        !ruleCounts.ContainsKey("AppManager_System_VPN_IKE_UDP") ||
+                        !ruleCounts.ContainsKey("AppManager_System_VPN_L2TP_UDP") ||
+                        !ruleCounts.ContainsKey("AppManager_System_VPN_PPTP_TCP") ||
+                        !ruleCounts.ContainsKey("AppManager_System_VPN_GRE") ||
+                        !ruleCounts.ContainsKey("AppManager_System_VPN_ESP") ||
+                        !ruleCounts.ContainsKey("AppManager_System_VPN_RasMan") ||
+                        !ruleCounts.ContainsKey("AppManager_System_VPN_Ikeext") ||
+                        !ruleCounts.ContainsKey("AppManager_System_VPN_SstpSvc"))
+                    {
+                        logger.LogWarning("System firewall rules tampered! Re-applying DNS/DHCP/NCSI/VPN rules...");
+                        await AddSystemRulesAsync(logger, cancellationToken);
                     }
                 }
             }
@@ -355,11 +603,14 @@ namespace FlutterFirewallManager
                 try
                 {
                     if (process.Id == currentPid) continue;
+                    if (ActiveClientPids.ContainsKey(process.Id)) continue; // Safeguard: Never kill dynamic authenticated clients
 
                     string path = process.MainModule?.FileName ?? "";
                     if (string.IsNullOrEmpty(path)) continue;
 
                     string normalized = NormalizePath(path);
+                    if (SafeApps.ContainsKey(normalized)) continue; // Safeguard: Never kill registered safe applications
+
                     if (BlockedApps.ContainsKey(normalized))
                     {
                         logger.LogWarning("Force closing running blocked application: {Path} (PID: {Pid})", path, process.Id);
@@ -388,11 +639,15 @@ namespace FlutterFirewallManager
                 try
                 {
                     if (process.Id == currentPid) continue;
+                    if (ActiveClientPids.ContainsKey(process.Id)) continue; // Safeguard: Never kill dynamic authenticated clients
 
                     string path = process.MainModule?.FileName ?? "";
                     if (string.IsNullOrEmpty(path)) continue;
 
-                    if (NormalizePath(path) == normalizedPath)
+                    string normalized = NormalizePath(path);
+                    if (SafeApps.ContainsKey(normalized)) continue; // Safeguard: Never kill registered safe applications
+
+                    if (normalized == normalizedPath)
                     {
                         process.Kill(true);
                     }
@@ -494,7 +749,22 @@ namespace FlutterFirewallManager
                 throw new InvalidOperationException("Cannot block or terminate the firewall manager service itself.");
             }
 
-            // 2. Prevent blocking critical Windows system processes
+            // 2. Prevent blocking any registered safe application
+            if (SafeApps.ContainsKey(normalized))
+            {
+                throw new InvalidOperationException($"Cannot block or terminate safe application: '{appPath}'.");
+            }
+
+            // 3. Prevent blocking active client applications dynamically
+            foreach (var clientPath in ActiveClientPids.Values)
+            {
+                if (!string.IsNullOrEmpty(clientPath) && NormalizePath(clientPath) == normalized)
+                {
+                    throw new InvalidOperationException("Cannot block or terminate the active client application.");
+                }
+            }
+
+            // 4. Prevent blocking critical Windows system processes
             var criticalApps = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
             {
                 "explorer.exe",
@@ -514,7 +784,7 @@ namespace FlutterFirewallManager
             }
         }
 
-        private static async Task DeleteRuleAsync(string ruleName, CancellationToken cancellationToken)
+        public static async Task DeleteRuleAsync(string ruleName, CancellationToken cancellationToken)
         {
             var (exitCode, stdout, stderr) = await RunNetshAsync(new[]
             {
@@ -529,7 +799,7 @@ namespace FlutterFirewallManager
             }
         }
 
-        private static async Task AddRuleAsync(string ruleName, string direction, string action, string appPath, CancellationToken cancellationToken)
+        public static async Task AddRuleAsync(string ruleName, string direction, string action, string appPath, CancellationToken cancellationToken)
         {
             var (exitCode, stdout, stderr) = await RunNetshAsync(new[]
             {
@@ -587,15 +857,400 @@ namespace FlutterFirewallManager
         }
 
         /// <summary>
+        /// Sets the Windows Firewall policy to block or allow outbound traffic by default.
+        /// </summary>
+        public static async Task SetFirewallPolicyAsync(bool blockOutboundByDefault, CancellationToken cancellationToken)
+        {
+            string policy = blockOutboundByDefault ? "blockinbound,blockoutbound" : "blockinbound,allowoutbound";
+            var (exitCode, stdout, stderr) = await RunNetshAsync(new[] { "advfirewall", "set", "allprofiles", "firewallpolicy", policy }, cancellationToken);
+            if (exitCode != 0)
+            {
+                throw new InvalidOperationException($"Failed to set firewall policy to {policy}. Exit code: {exitCode}. Error: {stderr.Trim()} {stdout.Trim()}");
+            }
+        }
+
+        /// <summary>
+        /// Removes all AppManager allow rules and system-wide critical rules.
+        /// </summary>
+        private static async Task DeleteAllAllowRulesAsync(ILogger logger, CancellationToken cancellationToken)
+        {
+            try
+            {
+                var ruleCounts = GetActiveRuleNameCounts(logger);
+                foreach (var ruleName in ruleCounts.Keys)
+                {
+                    if (ruleName.StartsWith(RulePrefixAllow, StringComparison.OrdinalIgnoreCase) ||
+                        ruleName.StartsWith("AppManager_System_", StringComparison.OrdinalIgnoreCase))
+                    {
+                        await DeleteRuleAsync(ruleName, cancellationToken);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Failed to delete allow and system rules.");
+            }
+        }
+
+        /// <summary>
+        /// Removes all AppManager block rules.
+        /// </summary>
+        private static async Task DeleteAllBlockRulesAsync(ILogger logger, CancellationToken cancellationToken)
+        {
+            try
+            {
+                var ruleCounts = GetActiveRuleNameCounts(logger);
+                foreach (var ruleName in ruleCounts.Keys)
+                {
+                    if (ruleName.StartsWith(RulePrefixBlock, StringComparison.OrdinalIgnoreCase))
+                    {
+                        await DeleteRuleAsync(ruleName, cancellationToken);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Failed to delete block rules.");
+            }
+        }
+
+        /// <summary>
+        /// Adds a protocol and port-based system rule.
+        /// </summary>
+        private static async Task AddSystemRuleAsync(string ruleName, string direction, string action, string protocol, string port, CancellationToken cancellationToken)
+        {
+            var (exitCode, stdout, stderr) = await RunNetshAsync(new[]
+            {
+                "advfirewall", "firewall", "add", "rule",
+                $"name={ruleName}",
+                $"dir={direction}",
+                $"action={action}",
+                $"protocol={protocol}",
+                $"remoteport={port}",
+                "enable=yes"
+            }, cancellationToken);
+
+            if (exitCode != 0)
+            {
+                throw new InvalidOperationException($"Failed to add system rule '{ruleName}'. Exit code: {exitCode}. Error: {stderr.Trim()} {stdout.Trim()}");
+            }
+        }
+
+        /// <summary>
+        /// Adds system rules required for basic connectivity (DNS, DHCP) in Whitelist mode.
+        /// </summary>
+        private static async Task AddSystemRulesAsync(ILogger logger, CancellationToken cancellationToken)
+        {
+            try
+            {
+                // 1. DNS UDP Port 53 Outbound
+                await DeleteRuleAsync("AppManager_System_DNS_UDP", cancellationToken);
+                await AddSystemRuleAsync("AppManager_System_DNS_UDP", "out", "allow", "udp", "53", cancellationToken);
+
+                // 2. DNS TCP Port 53 Outbound
+                await DeleteRuleAsync("AppManager_System_DNS_TCP", cancellationToken);
+                await AddSystemRuleAsync("AppManager_System_DNS_TCP", "out", "allow", "tcp", "53", cancellationToken);
+
+                // 3. DHCP UDP Port 67,68 Outbound
+                await DeleteRuleAsync("AppManager_System_DHCP_Out", cancellationToken);
+                await AddSystemRuleAsync("AppManager_System_DHCP_Out", "out", "allow", "udp", "67,68", cancellationToken);
+
+                // 4. NTP UDP Port 123 Outbound (Windows Time)
+                await DeleteRuleAsync("AppManager_System_NTP_Out", cancellationToken);
+                await AddSystemRuleAsync("AppManager_System_NTP_Out", "out", "allow", "udp", "123", cancellationToken);
+
+                // 5. Active Directory / Kerberos Port 88 UDP/TCP Outbound
+                await DeleteRuleAsync("AppManager_System_Kerberos_UDP", cancellationToken);
+                await AddSystemRuleAsync("AppManager_System_Kerberos_UDP", "out", "allow", "udp", "88", cancellationToken);
+                await DeleteRuleAsync("AppManager_System_Kerberos_TCP", cancellationToken);
+                await AddSystemRuleAsync("AppManager_System_Kerberos_TCP", "out", "allow", "tcp", "88", cancellationToken);
+
+                // 6. LDAP Port 389 UDP/TCP Outbound (Active Directory Domain query)
+                await DeleteRuleAsync("AppManager_System_LDAP_UDP", cancellationToken);
+                await AddSystemRuleAsync("AppManager_System_LDAP_UDP", "out", "allow", "udp", "389", cancellationToken);
+                await DeleteRuleAsync("AppManager_System_LDAP_TCP", cancellationToken);
+                await AddSystemRuleAsync("AppManager_System_LDAP_TCP", "out", "allow", "tcp", "389", cancellationToken);
+
+                // 7. Loopback Communication (Allow all local loopback)
+                await DeleteRuleAsync("AppManager_System_Loopback_Out", cancellationToken);
+                await RunNetshAsync(new[]
+                {
+                    "advfirewall", "firewall", "add", "rule",
+                    "name=AppManager_System_Loopback_Out",
+                    "dir=out",
+                    "action=allow",
+                    "remoteip=127.0.0.1",
+                    "enable=yes"
+                }, cancellationToken);
+
+                await DeleteRuleAsync("AppManager_System_Loopback_In", cancellationToken);
+                await RunNetshAsync(new[]
+                {
+                    "advfirewall", "firewall", "add", "rule",
+                    "name=AppManager_System_Loopback_In",
+                    "dir=in",
+                    "action=allow",
+                    "localip=127.0.0.1",
+                    "enable=yes"
+                }, cancellationToken);
+
+                // 8. Link-Local / mDNS / LLMNR for local name resolution
+                await DeleteRuleAsync("AppManager_System_mDNS_Out", cancellationToken);
+                await AddSystemRuleAsync("AppManager_System_mDNS_Out", "out", "allow", "udp", "5353,5355", cancellationToken);
+
+                // 9. Windows Network Connectivity Status Indicator (NCSI) HTTP/HTTPS probe
+                await DeleteRuleAsync("AppManager_System_NCSI_Out", cancellationToken);
+                await RunNetshAsync(new[]
+                {
+                    "advfirewall", "firewall", "add", "rule",
+                    "name=AppManager_System_NCSI_Out",
+                    "dir=out",
+                    "action=allow",
+                    "service=NlaSvc",
+                    "protocol=tcp",
+                    "remoteport=80,443",
+                    "enable=yes"
+                }, cancellationToken);
+
+                // 10. VPN IKE/NAT-T Outbound (UDP 500, 4500)
+                await DeleteRuleAsync("AppManager_System_VPN_IKE_UDP", cancellationToken);
+                await AddSystemRuleAsync("AppManager_System_VPN_IKE_UDP", "out", "allow", "udp", "500,4500", cancellationToken);
+
+                // 11. VPN L2TP Outbound (UDP 1701)
+                await DeleteRuleAsync("AppManager_System_VPN_L2TP_UDP", cancellationToken);
+                await AddSystemRuleAsync("AppManager_System_VPN_L2TP_UDP", "out", "allow", "udp", "1701", cancellationToken);
+
+                // 12. VPN PPTP Outbound (TCP 1723)
+                await DeleteRuleAsync("AppManager_System_VPN_PPTP_TCP", cancellationToken);
+                await AddSystemRuleAsync("AppManager_System_VPN_PPTP_TCP", "out", "allow", "tcp", "1723", cancellationToken);
+
+                // 13. VPN GRE Protocol (Protocol 47) Outbound
+                await DeleteRuleAsync("AppManager_System_VPN_GRE", cancellationToken);
+                await RunNetshAsync(new[]
+                {
+                    "advfirewall", "firewall", "add", "rule",
+                    "name=AppManager_System_VPN_GRE",
+                    "dir=out",
+                    "action=allow",
+                    "protocol=47",
+                    "enable=yes"
+                }, cancellationToken);
+
+                // 14. VPN ESP Protocol (Protocol 50) Outbound
+                await DeleteRuleAsync("AppManager_System_VPN_ESP", cancellationToken);
+                await RunNetshAsync(new[]
+                {
+                    "advfirewall", "firewall", "add", "rule",
+                    "name=AppManager_System_VPN_ESP",
+                    "dir=out",
+                    "action=allow",
+                    "protocol=50",
+                    "enable=yes"
+                }, cancellationToken);
+
+                // 15. VPN RasMan Service Outbound (Remote Access Connection Manager)
+                await DeleteRuleAsync("AppManager_System_VPN_RasMan", cancellationToken);
+                await RunNetshAsync(new[]
+                {
+                    "advfirewall", "firewall", "add", "rule",
+                    "name=AppManager_System_VPN_RasMan",
+                    "dir=out",
+                    "action=allow",
+                    "service=RasMan",
+                    "enable=yes"
+                }, cancellationToken);
+
+                // 16. VPN Ikeext Service Outbound (IKE and AuthIP IPsec Keying Modules)
+                await DeleteRuleAsync("AppManager_System_VPN_Ikeext", cancellationToken);
+                await RunNetshAsync(new[]
+                {
+                    "advfirewall", "firewall", "add", "rule",
+                    "name=AppManager_System_VPN_Ikeext",
+                    "dir=out",
+                    "action=allow",
+                    "service=Ikeext",
+                    "enable=yes"
+                }, cancellationToken);
+
+                // 17. VPN SSTP Service Outbound (Secure Socket Tunneling Protocol Service)
+                await DeleteRuleAsync("AppManager_System_VPN_SstpSvc", cancellationToken);
+                await RunNetshAsync(new[]
+                {
+                    "advfirewall", "firewall", "add", "rule",
+                    "name=AppManager_System_VPN_SstpSvc",
+                    "dir=out",
+                    "action=allow",
+                    "service=SstpSvc",
+                    "enable=yes"
+                }, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Failed to apply system firewall rules for DNS/DHCP/NTP/AD/Loopback/NCSI.");
+            }
+        }
+
+        /// <summary>
+        /// Applies the current filtering strategy (Blacklist or Whitelist) and configures the firewall policy & rules.
+        /// </summary>
+        public static async Task ApplyCurrentStrategyAsync(ILogger logger, CancellationToken cancellationToken)
+        {
+            if (IsAllowMode) return;
+
+            if (CurrentStrategy == FilteringStrategy.Blacklist)
+            {
+                logger.LogInformation("Applying BLACKLIST filtering strategy...");
+                
+                // 1. Set firewall policy to allow outbound by default
+                await SetFirewallPolicyAsync(false, cancellationToken);
+
+                // 2. Remove all whitelist (allow) rules and system rules to avoid leakage
+                await DeleteAllAllowRulesAsync(logger, cancellationToken);
+
+                // 3. Re-apply block rules for all blocked applications
+                foreach (var kvp in BlockedApps)
+                {
+                    try
+                    {
+                        string appPath = kvp.Value;
+                        string appName = Path.GetFileNameWithoutExtension(appPath);
+                        string blockRuleName = $"{RulePrefixBlock}{appName}";
+
+                        await DeleteRuleAsync(blockRuleName, cancellationToken);
+                        await AddRuleAsync(blockRuleName, "in", "block", appPath, cancellationToken);
+                        await AddRuleAsync(blockRuleName, "out", "block", appPath, cancellationToken);
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError(ex, "Failed to apply block rules for '{AppName}'", kvp.Value);
+                    }
+                }
+            }
+            else
+            {
+                logger.LogInformation("Applying WHITELIST filtering strategy...");
+
+                // 1. Set firewall policy to block outbound by default
+                await SetFirewallPolicyAsync(true, cancellationToken);
+
+                // 2. Remove all blacklist (block) rules
+                await DeleteAllBlockRulesAsync(logger, cancellationToken);
+
+                // 3. Add system critical rules (DNS, DHCP)
+                await AddSystemRulesAsync(logger, cancellationToken);
+
+                // 4. Re-apply allow rules for all safe applications
+                foreach (var kvp in SafeApps)
+                {
+                    try
+                    {
+                        string appPath = kvp.Value;
+                        string appName = Path.GetFileNameWithoutExtension(appPath);
+                        string allowRuleName = $"{RulePrefixAllow}{appName}";
+
+                        await DeleteRuleAsync(allowRuleName, cancellationToken);
+                        await AddRuleAsync(allowRuleName, "in", "allow", appPath, cancellationToken);
+                        await AddRuleAsync(allowRuleName, "out", "allow", appPath, cancellationToken);
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError(ex, "Failed to apply allow rules for safe app '{AppName}'", kvp.Value);
+                    }
+                }
+
+                // 4.5. Re-apply block rules for all blocked applications (overrides any general/system allow rules)
+                foreach (var kvp in BlockedApps)
+                {
+                    try
+                    {
+                        string appPath = kvp.Value;
+                        string appName = Path.GetFileNameWithoutExtension(appPath);
+                        string blockRuleName = $"{RulePrefixBlock}{appName}";
+
+                        await DeleteRuleAsync(blockRuleName, cancellationToken);
+                        await AddRuleAsync(blockRuleName, "in", "block", appPath, cancellationToken);
+                        await AddRuleAsync(blockRuleName, "out", "block", appPath, cancellationToken);
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError(ex, "Failed to apply block rules for '{AppName}' in whitelist mode", kvp.Value);
+                    }
+                }
+
+                // 5. Allow the firewall service itself
+                try
+                {
+                    string ownPath = Environment.ProcessPath ?? "";
+                    if (!string.IsNullOrEmpty(ownPath))
+                    {
+                        string allowRuleName = $"{RulePrefixAllow}FirewallService";
+                        await DeleteRuleAsync(allowRuleName, cancellationToken);
+                        await AddRuleAsync(allowRuleName, "in", "allow", ownPath, cancellationToken);
+                        await AddRuleAsync(allowRuleName, "out", "allow", ownPath, cancellationToken);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(ex, "Failed to apply allow rule for the firewall service itself.");
+                }
+
+                // 6. Allow active client applications dynamically
+                foreach (var clientPath in ActiveClientPids.Values)
+                {
+                    if (!string.IsNullOrEmpty(clientPath))
+                    {
+                        try
+                        {
+                            string appName = Path.GetFileNameWithoutExtension(clientPath);
+                            string allowRuleName = $"{RulePrefixAllow}Client_{appName}";
+                            await DeleteRuleAsync(allowRuleName, cancellationToken);
+                            await AddRuleAsync(allowRuleName, "in", "allow", clientPath, cancellationToken);
+                            await AddRuleAsync(allowRuleName, "out", "allow", clientPath, cancellationToken);
+                        }
+                        catch (Exception ex)
+                        {
+                            logger.LogError(ex, "Failed to apply dynamic allow rule for client '{ClientPath}'", clientPath);
+                        }
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Scans the active firewall rules and deletes any rule starting with AppManager_Block_ or AppManager_Allow_.
+        /// This ensures that when the system is in ALLOW mode, no block/allow rules are active.
+        /// </summary>
+        public static async Task DeleteAllAppManagerRulesAsync(ILogger logger, CancellationToken cancellationToken)
+        {
+            try
+            {
+                var ruleCounts = GetActiveRuleNameCounts(logger);
+                foreach (var ruleName in ruleCounts.Keys)
+                {
+                    if (ruleName.StartsWith(RulePrefixBlock, StringComparison.OrdinalIgnoreCase) ||
+                        ruleName.StartsWith(RulePrefixAllow, StringComparison.OrdinalIgnoreCase) ||
+                        ruleName.StartsWith("AppManager_System_", StringComparison.OrdinalIgnoreCase))
+                    {
+                        logger.LogInformation("Restoring firewall state: Deleting leftover custom rule '{RuleName}'", ruleName);
+                        try
+                        {
+                            await DeleteRuleAsync(ruleName, cancellationToken);
+                        }
+                        catch (Exception ex)
+                        {
+                            logger.LogError(ex, "Failed to delete leftover custom rule '{RuleName}'", ruleName);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Failed to scan and delete custom AppManager rules.");
+            }
+        }
+
+        /// <summary>
         /// Transitions the service mode between LOCKDOWN (default) and ALLOW.
-        /// In ALLOW mode:
-        /// 1. We remove all block rules for currently registered blocked applications.
-        /// 2. We unlock/disable the Windows Firewall.
-        /// 3. Process monitor loops and integrity loops are suspended.
-        /// In LOCKDOWN mode:
-        /// 1. We lock/enable the Windows Firewall.
-        /// 2. We re-apply block rules for all registered blocked applications.
-        /// 3. Background enforcement and process monitoring resume.
         /// </summary>
         public static async Task SetAllowModeAsync(bool enableAllowMode, ILogger logger, CancellationToken cancellationToken)
         {
@@ -603,25 +1258,34 @@ namespace FlutterFirewallManager
             if (enableAllowMode)
             {
                 logger.LogInformation("Transitioning to ALLOW mode. Suspending lockdown enforcement and removing firewall block rules...");
-                // 1. Remove all block rules for currently registered blocked applications
-                foreach (var kvp in BlockedApps)
+                Sentry.SentrySdk.CaptureMessage("Firewall transitioned to ALLOW mode (Unlocked).", Sentry.SentryLevel.Info);
+
+                // Clear the safe apps (allow list) database when exiting lockdown
+                SafeApps.Clear();
+                try
                 {
-                    try
-                    {
-                        string appName = Path.GetFileNameWithoutExtension(kvp.Value);
-                        string blockRuleName = $"{RulePrefixBlock}{appName}";
-                        string allowRuleName = $"{RulePrefixAllow}{appName}";
-                        await DeleteRuleAsync(blockRuleName, cancellationToken);
-                        await DeleteRuleAsync(allowRuleName, cancellationToken);
-                        logger.LogInformation("Removed firewall rules for '{AppName}' due to ALLOW mode transition.", appName);
-                    }
-                    catch (Exception ex)
-                    {
-                        logger.LogError(ex, "Failed to remove rules for '{AppName}' during ALLOW mode transition.", kvp.Value);
-                    }
+                    SaveSafeApps();
+                    logger.LogInformation("Safe apps database cleared on ALLOW mode transition.");
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(ex, "Failed to save empty safe apps database during ALLOW mode transition.");
                 }
                 
-                // 2. Unlock/disable the firewall profiles
+                // 1. Reset firewall policy to default (allow outbound)
+                try
+                {
+                    await SetFirewallPolicyAsync(false, cancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(ex, "Failed to reset firewall policy during ALLOW mode transition.");
+                }
+
+                // 2. Remove all AppManager block, allow, and system rules from the Windows Firewall
+                await DeleteAllAppManagerRulesAsync(logger, cancellationToken);
+                
+                // 3. Unlock/disable the firewall profiles
                 try
                 {
                     await UnlockFirewallAsync(cancellationToken);
@@ -634,7 +1298,8 @@ namespace FlutterFirewallManager
             }
             else
             {
-                logger.LogInformation("Transitioning to LOCKDOWN mode. Re-enabling firewall and applying block rules...");
+                logger.LogInformation("Transitioning to LOCKDOWN mode. Re-enabling firewall and applying strategy rules...");
+                Sentry.SentrySdk.CaptureMessage("Firewall transitioned to LOCKDOWN mode.", Sentry.SentryLevel.Info);
                 // 1. Lock/enable the firewall profiles
                 try
                 {
@@ -646,18 +1311,8 @@ namespace FlutterFirewallManager
                     logger.LogError(ex, "Failed to enable firewall profiles during LOCKDOWN mode transition.");
                 }
 
-                // 2. Re-apply block rules for all registered applications
-                foreach (var kvp in BlockedApps)
-                {
-                    try
-                    {
-                        await BlockApplicationAsync(kvp.Value, cancellationToken);
-                    }
-                    catch (Exception ex)
-                    {
-                        logger.LogError(ex, "Failed to re-apply block rule for '{AppName}' during LOCKDOWN mode transition.", kvp.Value);
-                    }
-                }
+                // 2. Apply rules and policy for current strategy
+                await ApplyCurrentStrategyAsync(logger, cancellationToken);
             }
         }
     }

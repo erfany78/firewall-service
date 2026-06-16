@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -21,6 +22,9 @@ namespace FlutterFirewallManager
 
         // Thread-safe dictionary tracking all authenticated client socket writers
         private static readonly ConcurrentDictionary<Guid, StreamWriter> ActiveWriters = new ConcurrentDictionary<Guid, StreamWriter>();
+
+        // Heartbeat watchdog timestamp
+        private static DateTime LastHeartbeatTime = DateTime.UtcNow;
 
         public FirewallWorker(ILogger<FirewallWorker> logger)
         {
@@ -51,48 +55,61 @@ namespace FlutterFirewallManager
         {
             _logger.LogInformation("Initializing FlutterFirewallManagerService database...");
             
+            // Check and log first run on device
+            try
+            {
+                string markerPath = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+                    "FlutterFirewallManager",
+                    "first_run.txt"
+                );
+                if (!File.Exists(markerPath))
+                {
+                    _logger.LogInformation("First run detected on this device. Logging to Sentry...");
+                    Sentry.SentrySdk.CaptureMessage("First run of Flutter Firewall Manager Service on device.", Sentry.SentryLevel.Info);
+                    
+                    // Create directory if it doesn't exist
+                    string dir = Path.GetDirectoryName(markerPath) ?? "";
+                    if (!Directory.Exists(dir))
+                    {
+                        Directory.CreateDirectory(dir);
+                    }
+                    File.WriteAllText(markerPath, DateTime.UtcNow.ToString("O"));
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to check or write first run marker.");
+            }
+
             // Load blocked application configuration from disk
             FirewallHelper.InitializeBlockedAppsList(_logger);
 
-            // Spin up the background process monitoring and force-closing loop (every 1s)
-            _ = Task.Run(() => StartProcessMonitoringLoopAsync(stoppingToken), stoppingToken);
+            // Load safe application configuration from disk
+            FirewallHelper.InitializeSafeAppsList(_logger);
+
+            // Load filtering strategy from disk
+            FirewallHelper.InitializeStrategy(_logger);
+
+            // Enforce default ALLOW mode on startup to prevent lockout if the service previously crashed in lockdown mode
+            try
+            {
+                _logger.LogInformation("Enforcing default ALLOW mode on startup...");
+                await FirewallHelper.SetAllowModeAsync(true, _logger, stoppingToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to enforce default ALLOW mode on startup.");
+            }
 
             // Spin up the background firewall and rule integrity enforcement loop (every 5s)
             _ = Task.Run(() => StartFirewallIntegrityLoopAsync(stoppingToken), stoppingToken);
 
+            // Spin up the client heartbeat watchdog loop (every 1s)
+            _ = Task.Run(() => StartWatchdogLoopAsync(stoppingToken), stoppingToken);
+
             // Start the TCP Listener loop
             await StartTcpListenerAsync(stoppingToken);
-        }
-
-        /// <summary>
-        /// Concurrent loop that scans running processes every 1 second and terminates blocked ones.
-        /// </summary>
-        private async Task StartProcessMonitoringLoopAsync(CancellationToken stoppingToken)
-        {
-            _logger.LogInformation("Process monitoring loop successfully started.");
-
-            while (!stoppingToken.IsCancellationRequested)
-            {
-                try
-                {
-                    FirewallHelper.ForceCloseRunningBlockedApps(_logger);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Exception encountered in process monitoring loop.");
-                }
-
-                try
-                {
-                    await Task.Delay(1000, stoppingToken);
-                }
-                catch (OperationCanceledException)
-                {
-                    break;
-                }
-            }
-
-            _logger.LogInformation("Process monitoring loop stopped.");
         }
 
         /// <summary>
@@ -184,6 +201,7 @@ namespace FlutterFirewallManager
         {
             Guid clientId = Guid.NewGuid();
             bool isAuthenticated = false;
+            int resolvedPid = -1;
 
             using (client)
             {
@@ -219,6 +237,46 @@ namespace FlutterFirewallManager
                                 {
                                     isAuthenticated = true;
                                     ActiveWriters[clientId] = writer; // Add to active broadcast list
+                                    LastHeartbeatTime = DateTime.UtcNow; // Reset heartbeat on authentication
+
+                                    // Dynamically resolve client process ID and register it
+                                    if (remoteEndPoint is IPEndPoint ipEndPoint)
+                                    {
+                                        resolvedPid = GetPidByClientPort((ushort)ipEndPoint.Port);
+                                        if (resolvedPid > 0)
+                                        {
+                                            string clientPath = "";
+                                            try
+                                            {
+                                                using var proc = System.Diagnostics.Process.GetProcessById(resolvedPid);
+                                                clientPath = proc.MainModule?.FileName ?? "";
+                                            }
+                                            catch (Exception ex)
+                                            {
+                                                _logger.LogWarning(ex, "Failed to resolve client process path for PID {Pid}", resolvedPid);
+                                            }
+
+                                            FirewallHelper.ActiveClientPids[resolvedPid] = clientPath;
+                                            _logger.LogInformation("Registered active client PID {Pid} ({Path})", resolvedPid, clientPath);
+
+                                            // If strategy is Whitelist and service is locked, immediately add allow rule for the client
+                                            if (!FirewallHelper.IsAllowMode && FirewallHelper.CurrentStrategy == FirewallHelper.FilteringStrategy.Whitelist && !string.IsNullOrEmpty(clientPath))
+                                            {
+                                                try
+                                                {
+                                                    string appName = Path.GetFileNameWithoutExtension(clientPath);
+                                                    string allowRuleName = $"AppManager_Allow_Client_{appName}";
+                                                    await FirewallHelper.AddRuleAsync(allowRuleName, "in", "allow", clientPath, cancellationToken);
+                                                    await FirewallHelper.AddRuleAsync(allowRuleName, "out", "allow", clientPath, cancellationToken);
+                                                }
+                                                catch (Exception ex)
+                                                {
+                                                    _logger.LogError(ex, "Failed to apply dynamic allow rule for client '{ClientPath}' during connection.", clientPath);
+                                                }
+                                            }
+                                        }
+                                    }
+
                                     _logger.LogInformation("Client {RemoteEndPoint} successfully authenticated.", remoteEndPoint);
                                     await writer.WriteLineAsync("SUCCESS: Authenticated");
                                     continue;
@@ -231,6 +289,13 @@ namespace FlutterFirewallManager
                         }
 
                         _logger.LogInformation("Received command from {RemoteEndPoint}: '{Command}'", remoteEndPoint, command);
+                        
+                        // Reset watchdog heartbeat on any incoming authenticated command
+                        if (isAuthenticated)
+                        {
+                            LastHeartbeatTime = DateTime.UtcNow;
+                        }
+
                         string response = await ProcessCommandAsync(command, cancellationToken);
                         _logger.LogInformation("Sending response to {RemoteEndPoint}: '{Response}'", remoteEndPoint, response);
 
@@ -249,6 +314,29 @@ namespace FlutterFirewallManager
                 {
                     // Clean up broadcast list registration
                     ActiveWriters.TryRemove(clientId, out _);
+
+                    // Clean up client PID registration if we resolved it
+                    if (resolvedPid > 0)
+                    {
+                        FirewallHelper.ActiveClientPids.TryRemove(resolvedPid, out var clientPath);
+                        _logger.LogInformation("Unregistered active client PID {Pid}", resolvedPid);
+
+                        // If strategy is Whitelist, remove its dynamic allow rule
+                        if (!FirewallHelper.IsAllowMode && FirewallHelper.CurrentStrategy == FirewallHelper.FilteringStrategy.Whitelist && !string.IsNullOrEmpty(clientPath))
+                        {
+                            try
+                            {
+                                string appName = Path.GetFileNameWithoutExtension(clientPath);
+                                string allowRuleName = $"AppManager_Allow_Client_{appName}";
+                                // Delete rules asynchronously (use CancellationToken.None to ensure cleanup runs even if cancelled)
+                                _ = FirewallHelper.DeleteRuleAsync(allowRuleName, CancellationToken.None);
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogError(ex, "Failed to delete dynamic allow rule for client '{ClientPath}' during teardown.", clientPath);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -307,6 +395,7 @@ namespace FlutterFirewallManager
             {
                 try
                 {
+                    LastHeartbeatTime = DateTime.UtcNow; // Reset heartbeat on lock transition
                     await FirewallHelper.SetAllowModeAsync(false, _logger, cancellationToken);
                     return "SUCCESS";
                 }
@@ -369,7 +458,209 @@ namespace FlutterFirewallManager
                 }
             }
 
+            // 8. GET_BLOCK_LIST command
+            if (command.Equals("GET_BLOCK_LIST", StringComparison.OrdinalIgnoreCase))
+            {
+                return $"BLOCK_LIST:{FirewallHelper.GetBlockedAppsList()}";
+            }
+
+            // 9. GET_SAFE_LIST command
+            if (command.Equals("GET_SAFE_LIST", StringComparison.OrdinalIgnoreCase))
+            {
+                return $"SAFE_LIST:{FirewallHelper.GetSafeAppsList()}";
+            }
+
+            // 10. ADD_SAFE:<AppPath> command
+            if (command.StartsWith("ADD_SAFE:", StringComparison.OrdinalIgnoreCase))
+            {
+                string appPath = command.Substring(9).Trim();
+                try
+                {
+                    await FirewallHelper.AddSafeAppAsync(appPath, cancellationToken);
+                    return "SUCCESS";
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error executing ADD_SAFE command for path: {AppPath}", appPath);
+                    return $"ERROR: {ex.Message}";
+                }
+            }
+
+            // 11. REMOVE_SAFE:<AppPath> command
+            if (command.StartsWith("REMOVE_SAFE:", StringComparison.OrdinalIgnoreCase))
+            {
+                string appPath = command.Substring(12).Trim();
+                try
+                {
+                    FirewallHelper.RemoveSafeApp(appPath);
+                    return "SUCCESS";
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error executing REMOVE_SAFE command for path: {AppPath}", appPath);
+                    return $"ERROR: {ex.Message}";
+                }
+            }
+
+            // 12. GET_STRATEGY command
+            if (command.Equals("GET_STRATEGY", StringComparison.OrdinalIgnoreCase))
+            {
+                return $"STRATEGY:{FirewallHelper.CurrentStrategy.ToString().ToUpperInvariant()}";
+            }
+
+            // 13. SET_STRATEGY:BLACKLIST command
+            if (command.Equals("SET_STRATEGY:BLACKLIST", StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    await FirewallHelper.SetStrategyAsync(FirewallHelper.FilteringStrategy.Blacklist, _logger, cancellationToken);
+                    return "SUCCESS";
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error executing SET_STRATEGY:BLACKLIST");
+                    return $"ERROR: {ex.Message}";
+                }
+            }
+
+            // 14. SET_STRATEGY:WHITELIST command
+            if (command.Equals("SET_STRATEGY:WHITELIST", StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    await FirewallHelper.SetStrategyAsync(FirewallHelper.FilteringStrategy.Whitelist, _logger, cancellationToken);
+                    return "SUCCESS";
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error executing SET_STRATEGY:WHITELIST");
+                    return $"ERROR: {ex.Message}";
+                }
+            }
+
+            // GET_VERSION command
+            if (command.Equals("GET_VERSION", StringComparison.OrdinalIgnoreCase))
+            {
+                return "VERSION:1.0.4";
+            }
+
+            // PING command
+            if (command.Equals("PING", StringComparison.OrdinalIgnoreCase))
+            {
+                LastHeartbeatTime = DateTime.UtcNow;
+                return "PONG";
+            }
+
             return "ERROR: Invalid or unknown command format.";
         }
+
+        /// <summary>
+        /// Periodic loop that acts as a heartbeat watchdog. If the service is in LOCKDOWN mode,
+        /// and no client is connected or the last message/heartbeat was over 10 seconds ago,
+        /// the firewall service automatically resets to ALLOW mode for user protection.
+        /// </summary>
+        private async Task StartWatchdogLoopAsync(CancellationToken stoppingToken)
+        {
+            _logger.LogInformation("Watchdog loop started.");
+
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                try
+                {
+                    if (!FirewallHelper.IsAllowMode)
+                    {
+                        var timeSinceLastHeartbeat = (DateTime.UtcNow - LastHeartbeatTime).TotalSeconds;
+
+                        if (timeSinceLastHeartbeat > 15.0)
+                        {
+                            _logger.LogWarning("Watchdog: Heartbeat timeout or connection lost ({Seconds}s > 15s). Restoring ALLOW mode...", timeSinceLastHeartbeat);
+                            await FirewallHelper.SetAllowModeAsync(true, _logger, stoppingToken);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Exception encountered in watchdog loop.");
+                }
+
+                try
+                {
+                    await Task.Delay(1000, stoppingToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+            }
+
+            _logger.LogInformation("Watchdog loop stopped.");
+        }
+
+        #region Native TCP helper for Dynamic Client PID resolution
+
+        [DllImport("iphlpapi.dll", SetLastError = true)]
+        private static extern uint GetExtendedTcpTable(
+            IntPtr pTcpTable,
+            ref int dwOutBufLen,
+            bool sort,
+            int ipVersion,
+            int tblClass,
+            uint reserved = 0);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MIB_TCPROW_OWNER_PID
+        {
+            public uint state;
+            public uint localAddr;
+            public uint localPort;
+            public uint remoteAddr;
+            public uint remotePort;
+            public int owningPid;
+        }
+
+        private static int GetPidByClientPort(ushort clientPort)
+        {
+            int bufferSize = 0;
+            // 2 = AF_INET (IPv4), 5 = TCP_TABLE_OWNER_PID_ALL
+            GetExtendedTcpTable(IntPtr.Zero, ref bufferSize, false, 2, 5, 0);
+
+            IntPtr tcpTablePtr = Marshal.AllocHGlobal(bufferSize);
+            try
+            {
+                if (GetExtendedTcpTable(tcpTablePtr, ref bufferSize, false, 2, 5, 0) == 0)
+                {
+                    int numEntries = Marshal.ReadInt32(tcpTablePtr);
+                    IntPtr rowPtr = (IntPtr)((long)tcpTablePtr + 4);
+
+                    int rowSize = Marshal.SizeOf<MIB_TCPROW_OWNER_PID>();
+
+                    for (int i = 0; i < numEntries; i++)
+                    {
+                        var row = Marshal.PtrToStructure<MIB_TCPROW_OWNER_PID>(rowPtr);
+                        
+                        ushort localPort = (ushort)(((row.localPort & 0xFF) << 8) | ((row.localPort >> 8) & 0xFF));
+                        ushort remotePort = (ushort)(((row.remotePort & 0xFF) << 8) | ((row.remotePort >> 8) & 0xFF));
+
+                        if (localPort == clientPort && remotePort == Port)
+                        {
+                            return row.owningPid;
+                        }
+
+                        rowPtr = (IntPtr)((long)rowPtr + rowSize);
+                    }
+                }
+            }
+            catch
+            {
+                // Fallback
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(tcpTablePtr);
+            }
+            return -1;
+        }
+
+        #endregion
     }
 }

@@ -11,6 +11,28 @@ namespace FlutterFirewallManager
     {
         public static void Main(string[] args)
         {
+            // Initialize Sentry SDK
+            Sentry.SentrySdk.Init(options =>
+            {
+                options.Dsn = "https://2ae52fce696e437690b012129eb58423@feedback.zfara.co/3";
+                options.TracesSampleRate = 0.01; // 1% of transactions
+                options.Release = "1.0.4";
+            });
+
+            // Configure global Sentry tags
+            Sentry.SentrySdk.ConfigureScope(scope =>
+            {
+                scope.SetTag("os_name", "Windows");
+                scope.SetTag("windows_version", Environment.OSVersion.ToString());
+                scope.SetTag("ip_address", GetLocalIpAddress());
+                scope.SetTag("version", "1.0.4");
+#if DEBUG
+                scope.SetTag("release_mode", "Debug");
+#else
+                scope.SetTag("release_mode", "Release");
+#endif
+            });
+
             // Register CodePages encoding provider to support OEM/Console code pages like 437
             Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
 
@@ -44,6 +66,29 @@ namespace FlutterFirewallManager
 
             var host = builder.Build();
             host.Run();
+        }
+
+        private static string GetLocalIpAddress()
+        {
+            try
+            {
+                var host = System.Net.Dns.GetHostEntry(System.Net.Dns.GetHostName());
+                foreach (var ip in host.AddressList)
+                {
+                    if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                    {
+                        if (!System.Net.IPAddress.IsLoopback(ip))
+                        {
+                            return ip.ToString();
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // Fallback
+            }
+            return "Unknown";
         }
     }
 }
